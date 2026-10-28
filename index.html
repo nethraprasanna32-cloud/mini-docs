@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mini Docs</title>
+<style>
+  :root { --paper:#fbfaf7; --ink:#1d2433; --line:#d9d5cb; --on:#2f7d5b; --off:#b4532a; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:#ece9e1; color:var(--ink); font:16px/1.6 Georgia, 'Times New Roman', serif; }
+  header { display:flex; flex-wrap:wrap; gap:.75rem 1.5rem; align-items:center; padding:.75rem 1.5rem; background:var(--paper); border-bottom:1px solid var(--line); font-family:system-ui, sans-serif; font-size:14px; }
+  h1 { font:600 18px Georgia, serif; margin:0 auto 0 0; }
+  #dot { display:inline-block; width:.6rem; height:.6rem; border-radius:50%; background:var(--off); margin-right:.4rem; }
+  #dot.on { background:var(--on); }
+  button { font:inherit; padding:.35rem .9rem; border:1px solid var(--ink); background:transparent; color:var(--ink); border-radius:4px; cursor:pointer; }
+  button:focus-visible, textarea:focus-visible { outline:2px solid var(--on); outline-offset:2px; }
+  main { max-width:48rem; margin:1.5rem auto; padding:0 1rem; }
+  textarea { width:100%; min-height:70vh; padding:2.5rem 3rem; border:1px solid var(--line); background:var(--paper); color:var(--ink); font:inherit; line-height:1.7; resize:vertical; }
+  main > #people { display:flex; flex-wrap:wrap; gap:.4rem; margin-bottom:.75rem; font:13px system-ui, sans-serif; color:#555; }
+  .chip { padding:.15rem .6rem; border-radius:999px; color:#fff; background:hsl(var(--h) 55% 38%); }
+  #name { font:inherit; padding:.3rem .5rem; width:9rem; border:1px solid var(--line); border-radius:4px; background:var(--paper); color:var(--ink); }
+  #wrap { position:relative; }
+  #wrap textarea { display:block; }
+  #carets { position:absolute; inset:0; pointer-events:none; overflow:hidden; }
+  .caret { position:absolute; width:2px; background:hsl(var(--h) 55% 38%); }
+  .caret b { position:absolute; bottom:100%; left:-1px; padding:0 .35rem; font:600 11px/1.5 system-ui, sans-serif; color:#fff; white-space:nowrap; border-radius:3px 3px 3px 0; background:hsl(var(--h) 55% 38%); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Mini Docs</h1>
+  <span><span id="dot"></span><span id="state">connecting</span></span>
+  <span id="pending"></span>
+  <input id="name" maxlength="20" aria-label="Your name" placeholder="Your name">
+  <span id="me"></span>
+  <button id="toggle">Go offline</button>
+</header>
+<main><div id="people"></div><div id="wrap"><textarea id="ta" placeholder="Start typing. Open this page in another tab to edit together." spellcheck="false"></textarea><div id="carets"></div></div></main>
+<script type="module">
+import { Doc } from './crdt.js';
+
+const docId = location.hash.slice(1) || 'main';
+// Client id is kept in sessionStorage: stable across reloads of this tab, distinct per tab.
+let me = null;
+try { me = sessionStorage.getItem(`mdocs:${docId}:client`); } catch {}
+if (!me) {
+  me = Math.random().toString(36).slice(2, 8);
+  try { sessionStorage.setItem(`mdocs:${docId}:client`, me); } catch {}
+}
+const doc = new Doc(me);
+const ta = document.getElementById('ta');
+
+// Names + presence (who is online / editing). Name is per tab and survives refresh.
+const nameEl = document.getElementById('name'), peopleEl = document.getElementById('people');
+try { nameEl.value = sessionStorage.getItem(`mdocs:${docId}:name`) || ''; } catch {}
+if (!nameEl.value) nameEl.value = `User ${me.slice(0, 3)}`;
+const hue = id => [...id].reduce((h, ch) => h + ch.charCodeAt(0) * 17, 0) % 360;
+const peers = new Map();
+function showPeople(users = []) {
+  peers.clear(); users.forEach(u => peers.set(u.id, u)); renderCursors();
+  peopleEl.replaceChildren();
+  if (!users.length) { peopleEl.textContent = 'Presence unavailable while offline'; return; }
+  users.forEach(u => {
+    const chip = document.createElement('span');
+    chip.className = 'chip';
+    chip.style.setProperty('--h', hue(u.id));
+    chip.textContent = u.name + (u.id === me ? ' (you)' : '') + (u.editing ? ' \u270E editing' : '');
+    peopleEl.append(chip);
+  });
+}
+nameEl.addEventListener('input', () => {
+  try { sessionStorage.setItem(`mdocs:${docId}:name`, nameEl.value); } catch {}
+  send({ type: 'NAME', name: nameEl.value });
+});
+// Remote cursors: a colored caret + name per other user, placed using a hidden mirror of the textarea.
+const wrap = document.getElementById('wrap'), carets = document.getElementById('carets');
+const mirror = document.createElement('div');
+mirror.style.cssText = 'position:absolute;top:0;left:0;visibility:hidden;white-space:pre-wrap;overflow-wrap:break-word;';
+wrap.append(mirror);
+const COPY = ['fontFamily','fontSize','fontWeight','fontStyle','lineHeight','letterSpacing','paddingTop','paddingRight','paddingBottom','paddingLeft','borderTopWidth','borderRightWidth','borderBottomWidth','borderLeftWidth','tabSize'];
+function caretXY(index) {
+  const cs = getComputedStyle(ta);
+  COPY.forEach(p => (mirror.style[p] = cs[p]));
+  mirror.style.boxSizing = 'border-box';
+  mirror.style.width = ta.clientWidth + parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth) + 'px';
+  mirror.textContent = doc.text.slice(0, index);
+  const mark = document.createElement('span');
+  mark.textContent = '\u200b';
+  mirror.append(mark);
+  return { x: mark.offsetLeft, y: mark.offsetTop - ta.scrollTop, h: parseFloat(cs.lineHeight) || 24 };
+}
+function renderCursors() {
+  carets.replaceChildren();
+  peers.forEach(u => {
+    if (u.id === me || u.cursor === undefined) return;
+    const { x, y, h } = caretXY(doc.cursorIndex(u.cursor));
+    if (y < -h || y > ta.clientHeight) return;
+    const c = document.createElement('div');
+    c.className = 'caret';
+    c.style.cssText = `left:${x}px;top:${y}px;height:${h}px`;
+    c.style.setProperty('--h', hue(u.id));
+    const tag = document.createElement('b');
+    tag.textContent = u.name + (u.editing ? ' \u270E' : '');
+    c.append(tag);
+    carets.append(c);
+  });
+}
+let cursorTimer;
+const sendCursor = () => { clearTimeout(cursorTimer); cursorTimer = setTimeout(() => send({ type: 'CURSOR', anchor: doc.cursorAt(ta.selectionStart) }), 40); };
+document.addEventListener('selectionchange', () => { if (document.activeElement === ta) sendCursor(); });
+ta.addEventListener('scroll', renderCursors);
+addEventListener('resize', renderCursors);
+
+let ws, online = true, serverVv = {}, backoff = 500, shown = '';
+let reconnectTimer = null, connectionGeneration = 0;
+// The Go offline switch is remembered for this tab, so a refresh stays offline until you click Go online.
+try { online = sessionStorage.getItem(`mdocs:${docId}:offline`) !== '1'; } catch {}
+
+// Local persistence: the op log (and what the server has acked) survives reloads and crashes.
+const storeKey = `mdocs:${docId}:${me}:state`;
+try {
+  const saved = JSON.parse(localStorage.getItem(storeKey) || 'null');
+  if (saved) { saved.log.forEach(op => doc.receive(op)); serverVv = saved.sv || {}; }
+} catch {}
+ta.value = shown = doc.text;
+
+const saveNow = () => { try { localStorage.setItem(storeKey, JSON.stringify({ log: doc.log, sv: serverVv })); } catch {} };
+let saveTimer;
+const save = () => { clearTimeout(saveTimer); saveNow(); }; // persist every edit before a sudden offline reload
+addEventListener('pagehide', saveNow);
+
+const send = m => ws && ws.readyState === 1 && ws.send(JSON.stringify(m));
+const unsynced = () => doc.opsSince(serverVv).length;
+
+function status() {
+  const up = online && ws && ws.readyState === WebSocket.OPEN;
+  document.getElementById('dot').className = up ? 'on' : '';
+  document.getElementById('state').textContent = up ? 'connected' : online ? 'reconnecting' : 'offline';
+  document.getElementById('pending').textContent = unsynced() ? `${unsynced()} edits not yet synced` : up ? 'all edits synced' : 'edits saved locally';
+  document.getElementById('me').textContent = `you: ${me}`;
+  document.getElementById('toggle').textContent = online ? 'Go offline' : 'Go online';
+}
+
+function connect() {
+  if (!online) return;
+  clearTimeout(reconnectTimer);
+  const generation = ++connectionGeneration;
+  const socket = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}`);
+  ws = socket;
+  socket.onopen = () => {
+    if (!online || generation !== connectionGeneration) return socket.close();
+    backoff = 500;
+    send({ type: 'HELLO', doc: docId, client: me, name: nameEl.value, vv: doc.vv });
+    status();
+  };
+  socket.onmessage = e => {
+    if (!online || generation !== connectionGeneration) return;
+    const m = JSON.parse(e.data);
+    if (m.type === 'PRESENCE') return showPeople(m.users);
+    if (m.type === 'CURSOR') { const u = peers.get(m.id); if (u) { u.cursor = m.anchor; renderCursors(); } return; }
+    if (m.type === 'SYNC' || m.type === 'OPS') { m.ops.forEach(o => doc.receive(o)); render(); }
+    if (m.type === 'SYNC') { serverVv = m.vv; const ops = doc.opsSince(serverVv); if (ops.length) send({ type: 'OPS', ops }); }
+    if (m.type === 'ACK') serverVv = m.vv;
+    save();
+    status();
+  };
+  socket.onclose = () => {
+    if (generation !== connectionGeneration) return;
+    ws = null;
+    showPeople(); status();
+    if (online) {
+      reconnectTimer = setTimeout(connect, backoff);
+      backoff = Math.min(backoff * 2, 8000);
+    }
+  };
+  socket.onerror = () => { /* close event handles recovery */ }; 
+}
+
+// Apply remote changes to the textarea, shifting the caret if the change was before it.
+function render() {
+  const next = doc.text, old = ta.value;
+  if (next === old) return;
+  let p = 0;
+  while (p < old.length && p < next.length && old[p] === next[p]) p++;
+  let caret = ta.selectionStart;
+  if (p < caret) caret = Math.max(p, caret + next.length - old.length);
+  ta.value = shown = next;
+  ta.setSelectionRange(caret, caret);
+  renderCursors();
+}
+
+// Turn a textarea edit into CRDT ops via common prefix/suffix diff.
+ta.addEventListener('input', () => {
+  const a = shown, b = ta.value;
+  let p = 0;
+  while (p < a.length && p < b.length && a[p] === b[p]) p++;
+  let s = 0;
+  while (s < a.length - p && s < b.length - p && a[a.length - 1 - s] === b[b.length - 1 - s]) s++;
+  const ops = [];
+  for (let k = 0; k < a.length - p - s; k++) ops.push(doc.deleteAt(p));
+  [...b.slice(p, b.length - s)].forEach((ch, k) => ops.push(doc.insertAt(p + k, ch)));
+  shown = doc.text;
+  renderCursors();
+  send({ type: 'OPS', ops });   // offline operations remain in the log for reconnection
+  save();
+  status();
+});
+
+document.getElementById('toggle').onclick = () => {
+  online = !online;
+  try { sessionStorage.setItem(`mdocs:${docId}:offline`, online ? '' : '1'); } catch {}
+  if (online) {
+    connect();
+  } else {
+    ++connectionGeneration; // invalidate outstanding socket callbacks
+    clearTimeout(reconnectTimer);
+    const oldSocket = ws;
+    ws = null;
+    if (oldSocket) oldSocket.close();
+    showPeople();
+    saveNow();
+  }
+  status();
+};
+
+if (!online) showPeople();
+connect();
+status();
+</script>
+</body>
+</html>
